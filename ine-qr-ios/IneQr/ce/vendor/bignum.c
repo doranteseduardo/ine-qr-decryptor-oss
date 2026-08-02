@@ -1,0 +1,1 @@
+../../../../ine-qr-wasm/vendor/bignum.c

@@ -1,0 +1,45 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ine-qr-api:local
+    container_name: ine-qr-api
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: 8080
+      API_KEY: ${API_KEY:-}
+      WORKERS: ${WORKERS:-0}            # 0 = NumCPU * 5/4
+      QUEUE_WAIT_MS: ${QUEUE_WAIT_MS:-2000}
+      MAX_BODY_MB: ${MAX_BODY_MB:-25}
+      RATE_PER_SEC: ${RATE_PER_SEC:-0}    # 0 = disabled (matches Dockerfile default)
+      RATE_BURST: ${RATE_BURST:-10}
+      MAX_LONG_EDGE: ${MAX_LONG_EDGE:-3000}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp                            # required only for any leftover scratch I/O
+
+  # The same decoder + HTTP API reimplemented in Eskiu (see ine-qr-eskiu/).
+  # x86-64 image (vendored Linux eskiuc); runs on :8081 beside the Go one.
+  eskiu:
+    build:
+      context: .
+      dockerfile: ine-qr-eskiu/Dockerfile
+    platform: linux/amd64        # vendored eskiuc is x86-64
+    image: ine-qr-eskiu:local
+    container_name: ine-qr-eskiu
+    ports:
+      - "8081:8080"
+    environment:
+      PORT: 8080
+      API_KEY: ${API_KEY:-}
+      WORKERS: ${WORKERS:-4}
+      MAX_BODY_MB: ${MAX_BODY_MB:-25}
+      RATE_PER_SEC: ${RATE_PER_SEC:-0}
+      RATE_BURST: ${RATE_BURST:-10}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp                            # decode writes the upload to a temp file

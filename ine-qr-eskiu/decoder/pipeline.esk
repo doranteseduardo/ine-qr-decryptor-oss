@@ -1,0 +1,84 @@
+// pipeline.esk — The three decode stages.
+//
+// Each stage function returns Result<int, string> (simple success/error)
+// and writes its output into a caller-provided buffer.  This avoids large
+// struct returns through multiple stack frames while keeping clean error
+// propagation via Result<T,E>.
+//
+// Ownership rule: the *caller* allocates output buffers; stages that
+// produce heap memory (Stage 2 plain, Stage 3 json/webp) document which
+// pointer the caller must free().
+
+import <mem>;
+
+import "types.esk";
+import "extern.esk";
+import "crypto.esk";
+import "output.esk";
+
+// ── Stage 1 ───────────────────────────────────────────────────────────────────
+//
+// Extract the two QR payloads from a credential image.
+// Writes into *qr_out; caller owns the struct (stack-allocated is fine).
+
+Result<int, string> stage_extract(string image_path, *QRPair qr_out) {
+    if (ine_qr_extract(image_path, qr_out) == 0 || qr_out.ok == 0) {
+        return Err<int, string>("QR extraction failed — check image path and format");
+    }
+    return Ok<int, string>(1);
+}
+
+// ── Stage 2 ───────────────────────────────────────────────────────────────────
+//
+// Run the multi-round AES-256-CBC + RSA-8192 pipeline on the QR payloads.
+//
+// The input is qr.left[2:] + qr.right[2:] (1712 bytes).  All crypto
+// constants are embedded in the C library — no key file needed.
+//
+// On success: *plain_out receives a heap-allocated buffer; caller must free().
+//             *plain_len receives its length.
+
+Result<int, string> stage_crypto(*QRPair qr, **uint8 plain_out, *int64 plain_len) {
+    let combined: *uint8 = alloc<uint8>(1712);
+    memcpy(combined,       &qr.left[2],  856);
+    memcpy(combined + 856, &qr.right[2], 856);
+
+    int rc = run_no_so_pipeline(combined, 1712, plain_out, plain_len);
+    // plain_len is int64 matching C's size_t
+    free(combined);
+
+    if (rc != 0 || plain_out[0] == null) {
+        return Err<int, string>("crypto pipeline failed");
+    }
+    return Ok<int, string>(1);
+}
+
+// ── Stage 3 ───────────────────────────────────────────────────────────────────
+//
+// Parse the plaintext into structured output.
+//
+// On success: *json_out and *webp_out receive heap-allocated buffers;
+//             caller must free() each non-null pointer.
+// Frees *plain before returning (transfers ownership).
+
+Result<int, string> stage_decode(*uint8 plain, int64 plain_len,
+                                  **char json_out, *int64 json_len,
+                                  **uint8 webp_out, *int64 webp_len) {
+    int rc = decode_to_buffers(plain, plain_len,
+                                json_out, json_len,
+                                webp_out, webp_len);
+    free(plain);
+
+    if (rc != 0) {
+        return Err<int, string>("output decode failed");
+    }
+    return Ok<int, string>(1);
+}
+
+// ── Timing helper ─────────────────────────────────────────────────────────────
+
+// CLOCKS_PER_SEC = 1,000,000 on macOS; divide by 1000 converts µs → ms.
+double ticks_to_ms(int64 ticks) {
+    double ms = ticks / 1000.0;
+    return ms;
+}

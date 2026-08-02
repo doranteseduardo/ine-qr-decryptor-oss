@@ -1,0 +1,56 @@
+// pipeline_test.esk — validates the pure-Eskiu crypto + output stages against
+// the pre-extracted QR payloads in output/ (no macOS QR shim needed).
+//
+//   eskiuc ine-qr-eskiu/tests/pipeline_test.esk -o /tmp/pt -L<openssl>/lib -lcrypto
+//   (run from the project root so the output/*.bin paths resolve)
+
+import <mem>;
+import "../decoder/types.esk";
+import "../decoder/crypto.esk";
+import "../decoder/output.esk";
+
+// extern.esk (pulled in transitively) already declares printf/fopen/fclose/memcpy;
+// we only add fread here.
+extern int64 fread(*void buf, int64 sz, int64 n, *void fp);
+
+int read_payload(string path, *uint8 dst) {
+    *void fp = fopen(path, "rb");
+    if (fp == null) { return 0; }
+    int64 n = fread((*void)dst, 1, 858, fp);
+    fclose(fp);
+    return (int)n;
+}
+
+int main() {
+    let qr: QRPair;
+    qr.ok = 1;
+    int a = read_payload("output/qr_izquierdo.bin", &qr.left[0]);
+    int b = read_payload("output/qr_derecho.bin",   &qr.right[0]);
+    printf("read: left=%d right=%d (expect 858/858)\n", a, b);
+    if (a != 858 || b != 858) { printf("FAIL: bad payload sizes\n"); return 1; }
+
+    // Combine exactly like stage_crypto: drop the 2-byte prefix on each side.
+    *uint8 combined = alloc<uint8>(1712);
+    memcpy(combined,       &qr.left[2],  856);
+    memcpy(combined + 856, &qr.right[2], 856);
+
+    let plain: *uint8 = null;
+    int64 plain_len   = 0;
+    int rc = run_no_so_pipeline(combined, 1712, &plain, &plain_len);
+    free(combined);
+    if (rc != 0 || plain == null) { printf("FAIL: crypto rc=%d\n", rc); return 1; }
+    defer free(plain);      // crypto output — freed on every exit below
+    printf("crypto ok: %lld bytes\n", plain_len);
+
+    let json: *char  = null;  int64 json_len = 0;
+    let webp: *uint8 = null;  int64 webp_len = 0;
+    rc = decode_to_buffers(plain, plain_len, &json, &json_len, &webp, &webp_len);
+    if (rc != 0) { printf("FAIL: decode rc=%d\n", rc); return 1; }
+
+    printf("\n--- JSON (%lld bytes) ---\n%s\n", json_len, json);
+    printf("--- WebP: %lld bytes ---\n", webp_len);
+
+    if (json != null) free(json);
+    if (webp != null) free(webp);
+    return 0;
+}

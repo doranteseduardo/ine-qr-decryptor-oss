@@ -1,0 +1,49 @@
+// ratelimit.esk — per-identity token bucket over the stdlib Map<V>.
+//
+// A Map<RlBucket> (string identity → bucket) replaces the old fixed-size table:
+// no hash collisions sharing buckets, grows as needed. Guarded by a Mutex.
+// RATE_PER_SEC = 0 disables it.
+
+import <threading>;
+import <time>;
+import <map>;
+
+struct RlBucket { double tokens; int64 last_ms; }
+
+struct RateLimiter {
+    Map<RlBucket> buckets;
+    Mutex  mu;
+    double rate;       // tokens per second
+    double burst;      // bucket capacity
+    int    enabled;
+}
+
+void rl_init(RateLimiter* self, double rate, int burst, int enabled) {
+    Map_init<RlBucket>(&self.buckets, 64);
+    Mutex_init(&self.mu);
+    self.rate    = rate;
+    self.burst   = (double)burst;
+    self.enabled = enabled;
+}
+
+// 1 = allowed, 0 = rejected (429).
+int rl_allow(RateLimiter* self, string identity) {
+    if (self.enabled == 0) { return 1; }
+    int64 now = time_now_ms();
+
+    Mutex_lock(&self.mu);
+    int created = 0;
+    *RlBucket b = Map_at<RlBucket>(&self.buckets, identity, &created);
+    if (created == 1) { b.tokens = self.burst;  b.last_ms = now; }
+
+    double elapsed = (double)(now - b.last_ms) / 1000.0;
+    double t = b.tokens + elapsed * self.rate;
+    if (t > self.burst) { t = self.burst; }
+    b.last_ms = now;
+
+    int allow = 0;
+    if (t >= 1.0) { t = t - 1.0;  allow = 1; }
+    b.tokens = t;
+    Mutex_unlock(&self.mu);
+    return allow;
+}

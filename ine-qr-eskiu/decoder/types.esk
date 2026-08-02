@@ -1,0 +1,42 @@
+// types.esk — Core data types for the QR decoder pipeline.
+//
+// The three stages of the pipeline each consume and produce a typed value:
+//
+//   image path  → stage_extract  → QRPair
+//   QRPair      → stage_crypto   → DecodePayload
+//   DecodePayload → stage_decode → DecodeOutput
+
+import <result>;
+
+// Two 858-byte QR payloads extracted from the credential image.
+// Produced by stage_extract().
+struct QRPair {
+    uint8[858] left;
+    uint8[858] right;
+    int        ok;
+    char[256]  err;
+}
+
+// Raw decrypted plaintext — output of the crypto pipeline.
+// .data is heap-allocated; the owner must call free(payload.data).
+struct DecodePayload {
+    *uint8 data;
+    int    len;
+}
+
+// Parsed output: JSON biographical data + raw WebP photo.
+// Both pointers are heap-allocated; the owner must free() each.
+struct DecodeOutput {
+    *char  json;
+    int    json_len;
+    *uint8 webp;
+    int    webp_len;
+}
+
+// Wall-clock timing for each pipeline stage, in milliseconds.
+struct PipelineTiming {
+    double qr_ms;
+    double crypto_ms;
+    double decode_ms;
+    double total_ms;
+}

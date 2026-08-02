@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  # macOS leg: builds the C reference + runs the iOS SwiftPM parity tests.
+  # The iOS tests compile the same shared C sources used by every other
+  # path (no_so_crypto.c, output_decode.c, vendored crypto), so a passing
+  # `swift test` here certifies the C pipeline is byte-exact.
+  c-and-ios:
+    name: C build + iOS parity (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL + zxing-cpp
+        run: brew install openssl@3 zxing-cpp pkg-config
+
+      - name: Build ine-qr-c
+        run: cd ine-qr-c && make
+
+      - name: Run iOS parity tests
+        run: cd ine-qr-ios && swift test
+
+  # Linux leg: builds the static archive (libine_decode.a) the Go API
+  # actually consumes via cgo. zxing-cpp has no apt package, so we build
+  # it from source — cached so subsequent runs are fast.
+  c-linux:
+    name: libine_decode.a (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config build-essential cmake git
+
+      - name: Cache zxing-cpp install
+        id: cache-zxing
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/zxing-cpp
+          key: zxing-cpp-3.0.2-${{ runner.os }}
+
+      - name: Build zxing-cpp 3.0.2 from source
+        if: steps.cache-zxing.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v3.0.2 https://github.com/zxing-cpp/zxing-cpp.git /tmp/zxing-cpp
+          cmake -S /tmp/zxing-cpp -B /tmp/zxing-cpp/build \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DZXING_EXAMPLES=OFF \
+            -DZXING_BLACKBOX_TESTS=OFF \
+            -DZXING_UNIT_TESTS=OFF \
+            -DZXING_C_API=OFF \
+            -DZXING_WRITERS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local/zxing-cpp
+          cmake --build /tmp/zxing-cpp/build -j"$(nproc)"
+          sudo cmake --install /tmp/zxing-cpp/build
+
+      - name: Expose zxing-cpp to pkg-config
+        run: |
+          echo "PKG_CONFIG_PATH=/usr/local/zxing-cpp/lib/pkgconfig:/usr/local/zxing-cpp/lib64/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=/usr/local/zxing-cpp/lib:/usr/local/zxing-cpp/lib64" >> "$GITHUB_ENV"
+
+      - name: Build libine_decode.a
+        run: cd ine-qr-c && make lib
+
+  # Android leg: assembles the AAR. CMake FetchContent pulls BoringSSL
+  # on first run; we cache the build output so subsequent runs are fast.
+  android-aar:
+    name: Android AAR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+
+      - name: Cache BoringSSL FetchContent output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ine-qr-android/ine-qr/.cxx
+            ine-qr-android/ine-qr/build/intermediates/cxx
+          key: boringssl-${{ runner.os }}-${{ hashFiles('ine-qr-android/ine-qr/src/main/cpp/CMakeLists.txt') }}
+
+      - name: Assemble release AAR
+        run: cd ine-qr-android && gradle :ine-qr:assembleRelease --no-daemon
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ine-qr-release.aar
+          path: ine-qr-android/ine-qr/build/outputs/aar/ine-qr-release.aar
+          if-no-files-found: error
+
+  # Cheap drift detector: the OpenSSL and BoringSSL backend bodies must
+  # stay byte-identical from `#include "ine_crypto_backend.h"` onward.
+  # If anyone edits one without the other, this fails.
+  backend-sync:
+    name: crypto backend sync (OpenSSL <-> BoringSSL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Diff post-include bodies
+        run: |
+          extract() {
+            awk '/^#include "ine_crypto_backend.h"/{flag=1} flag' "$1"
+          }
+          if ! diff -u \
+              <(extract ine-qr-c/src/crypto_backend_openssl.c) \
+              <(extract ine-qr-android/ine-qr/src/main/cpp/crypto_backend_boringssl.c); then
+            echo
+            echo "::error::OpenSSL and BoringSSL backend bodies have diverged."
+            echo "Both files must stay byte-identical from the first \"ine_crypto_backend.h\" include onward."
+            echo "Sync them and re-run."
+            exit 1
+          fi
+          echo "OK: bodies are byte-identical."

@@ -1,0 +1,102 @@
+// decode_api.esk — wrap the 3-stage pipeline so it consumes image *bytes*
+// (as received over HTTP) and produces the API's JSON response.
+//
+// The pipeline's stage_extract() takes a file path (the C++/CoreGraphics QR
+// shim reads files), so we write the uploaded bytes to a unique temp file,
+// run the pipeline, then splice "foto_base64" (the WebP, base64-encoded) into
+// the 18-field JSON object — matching the Go API's response shape.
+
+import <mem>;
+import <base64>;
+import <string>;
+import <atomic>;
+
+import "../decoder/pipeline.esk";   // stage_extract / stage_crypto / stage_decode (+ types, crypto, output)
+
+extern int remove(string path);     // unlink the temp file when done
+
+// Unique temp-file sequence (atomic increment; safe across worker threads).
+int g_tmp_seq = 0;
+
+int next_seq() {
+    while (1) {
+        int v = atomic_load(&g_tmp_seq);
+        if (atomic_cas(&g_tmp_seq, v, v + 1)) { return v; }
+    }
+}
+
+// Sniff the image container from magic bytes → file extension. The extension
+// matters: ine-qr-c's qr_extract uses it to trigger the macOS HEIC→jpg `sips`
+// fallback; stb_image reads JPEG/PNG directly regardless.
+string sniff_ext(*uint8 b, int64 n) {
+    if (n >= 3 && b[0] == 255 && b[1] == 216 && b[2] == 255) { return "jpg"; }          // FF D8 FF
+    if (n >= 8 && b[0] == 137 && b[1] == 80 && b[2] == 78 && b[3] == 71) { return "png"; } // 89 'PNG'
+    if (n >= 12 && b[4] == 102 && b[5] == 116 && b[6] == 121 && b[7] == 112) { return "heic"; } // 'ftyp'
+    return "jpg";
+}
+
+// Build "/tmp/ine_eskiu_<seq>.<ext>" into `out`.
+void temp_path(String* out, int seq, string ext) {
+    String_clear(out);
+    String_append(out, "/tmp/ine_eskiu_");
+    let n: String;  String_init(&n, 16);  String_from_int(&n, seq);
+    String_append(out, String_cstr(&n));
+    String_free(&n);
+    String_push(out, '.');
+    String_append(out, ext);
+}
+
+// Decode `img` (img_len bytes). On success returns 1 and fills `resp` with the
+// final JSON (18 fields + foto_base64). On failure returns 0 and fills `err`.
+// Caller owns `resp` and `err` (init/free them).
+int decode_image_to_json(*uint8 img, int64 img_len, String* resp, String* err) {
+    if (img_len <= 0) { String_append(err, "empty image"); return 0; }
+
+    // 1. Persist bytes to a temp file (the QR shim reads from a path).
+    let tmp: String;  String_init(&tmp, 48);  temp_path(&tmp, next_seq(), sniff_ext(img, img_len));
+    *void fp = fopen(String_cstr(&tmp), "wb");
+    if (fp == null) { String_append(err, "temp file create failed"); String_free(&tmp); return 0; }
+    fwrite((*void)img, 1, (int)img_len, fp);
+    fclose(fp);
+
+    // 2. Stage 1 — QR extraction (macOS CoreGraphics + zxing).
+    let qr: QRPair;
+    let r1: Result<int, string> = stage_extract(String_cstr(&tmp), &qr);
+    remove(String_cstr(&tmp));        // temp no longer needed
+    String_free(&tmp);
+    if (r1.ok == 0) { String_append(err, r1.error); return 0; }
+
+    // 3. Stage 2 — crypto pipeline.
+    let plain: *uint8 = null;  int64 plain_len = 0;
+    let r2: Result<int, string> = stage_crypto(&qr, &plain, &plain_len);
+    if (r2.ok == 0) { String_append(err, r2.error); return 0; }
+
+    // 4. Stage 3 — output decode (takes ownership of `plain`).
+    let json: *char  = null;  int64 json_len = 0;
+    let webp: *uint8 = null;  int64 webp_len = 0;
+    let r3: Result<int, string> = stage_decode(plain, plain_len,
+                                               &json, &json_len, &webp, &webp_len);
+    if (r3.ok == 0) { String_append(err, r3.error); return 0; }
+
+    // 5. Splice foto_base64 into the JSON object (before the closing '}').
+    int jl = (int)json_len;
+    if (webp != null && webp_len > 0) {
+        int i = 0;
+        while (i < jl - 1) { String_push(resp, json[i]); i = i + 1; }   // all but trailing '}'
+        String_append(resp, ",\"foto_base64\":\"");
+        int b64cap = base64_encoded_len((int)webp_len) + 1;
+        *uint8 b64 = alloc<uint8>(b64cap);
+        int b64len = base64_encode(webp, (int)webp_len, b64);
+        int k = 0;
+        while (k < b64len) { String_push(resp, (char)b64[k]); k = k + 1; }
+        free(b64);
+        String_append(resp, "\"}");
+    } else {
+        int i = 0;
+        while (i < jl) { String_push(resp, json[i]); i = i + 1; }
+    }
+
+    if (json != null) { free(json); }
+    if (webp != null) { free(webp); }
+    return 1;
+}

@@ -1,0 +1,122 @@
+// output.esk — Structured output decoder in Eskiu.
+// Parses the binary payload from run_no_so_pipeline into JSON + WebP.
+//
+// Input format:
+//   [text_len:u16 BE][text_bytes:text_len][img_len:u16 BE][img_bytes:img_len]
+// text_bytes are 6-bit coded values indexing into the Spanish character table.
+
+import <mem>;
+import <string>;   // String + String_next_token (field split)
+import <json>;     // Json builder
+
+import "types.esk";
+import "extern.esk";
+
+// ── Character table: maps 6-bit code (1-indexed) to UTF-8 string ─────────────
+//
+// 1-14  → A-N  |  15 → Ñ (two UTF-8 bytes)  |  16-27 → O-Z
+// 28-37 → 0-9  |  40 → /  |  57 → | (field separator)
+
+string char_lookup(uint8 code) {
+    switch ((int)code) {
+        case 1:  return "A";  case 2:  return "B";  case 3:  return "C";
+        case 4:  return "D";  case 5:  return "E";  case 6:  return "F";
+        case 7:  return "G";  case 8:  return "H";  case 9:  return "I";
+        case 10: return "J";  case 11: return "K";  case 12: return "L";
+        case 13: return "M";  case 14: return "N";
+        case 15: return "Ñ";           // Ñ = UTF-8 C3 91, written literally (Eskiu has no \x escape)
+        case 16: return "O";  case 17: return "P";  case 18: return "Q";
+        case 19: return "R";  case 20: return "S";  case 21: return "T";
+        case 22: return "U";  case 23: return "V";  case 24: return "W";
+        case 25: return "X";  case 26: return "Y";  case 27: return "Z";
+        case 28: return "0";  case 29: return "1";  case 30: return "2";
+        case 31: return "3";  case 32: return "4";  case 33: return "5";
+        case 34: return "6";  case 35: return "7";  case 36: return "8";
+        case 37: return "9";
+        case 40: return "/";
+        case 57: return "|";   // field separator
+        default: return "";
+    }
+}
+
+// Field labels for the 18 biographical fields (in order).
+string field_label(int idx) {
+    string[18] labels = {
+        "tipo", "cic", "ocr", "curp", "nombre", "apellido1", "apellido2",
+        "entidad", "municipio", "seccion", "etnia", "vigencia", "sexo",
+        "indiceHuella1", "indiceHuella2", "version", "fechaGeneracion", "firmaVerificadora",
+    };
+    if (idx < 0 || idx > 17) { return "campo"; }
+    return labels[idx];
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+int decode_to_buffers(*uint8 payload, int64 pay_len,
+                      **char json_out, *int64 json_len,
+                      **uint8 webp_out, *int64 webp_len) {
+    json_out[0] = null;   json_len[0] = 0;
+    webp_out[0] = null;   webp_len[0] = 0;
+
+    if (pay_len < 4) {
+        printf("[!] payload too short (%d)\n", (int)pay_len);
+        return -1;
+    }
+
+    // Parse header
+    int64 tlen = ((int64)payload[0] << 8) | payload[1];
+    if (2 + tlen + 2 > pay_len) {
+        printf("[!] text_len %d exceeds buffer\n", (int)tlen);
+        return -1;
+    }
+    let tdata: *uint8 = payload + 2;
+    int64 ioff = 2 + tlen;
+    int64 ilen = ((int64)payload[ioff] << 8) | payload[ioff + 1];
+    if (ioff + 2 + ilen > pay_len) if (pay_len > ioff + 2) { ilen = pay_len - ioff - 2; } else { ilen = 0; }
+    let idata: *uint8 = payload + ioff + 2;
+
+    // Decode text bytes through the character table → a UTF-8 String.
+    let text: String;  String_init(&text, (int)(tlen * 3 + 1));
+    int64 i = 0;
+    while (i < tlen) {
+        uint8 bv = tdata[i];
+        if (bv != 0) {
+            string ch = char_lookup(bv);
+            if (ch[0] != 0) { String_append(&text, ch); }
+        }
+        i += 1;
+    }
+
+    // Split on '|' (streaming) and build the JSON object with <json>.
+    let j: Json;  Json_init(&j);
+    Json_obj_begin(&j);
+    let fld: String;  String_init(&fld, 16);
+    int pos = 0;
+    int nf = 0;
+    while (String_next_token(&text, '|', &pos, &fld) == 1 && nf < 22) {
+        Json_key(&j, field_label(nf));
+        Json_str(&j, String_cstr(&fld));   // escapes " and \ automatically
+        nf = nf + 1;
+    }
+    Json_obj_end(&j);
+
+    // Hand the rendered JSON to the caller (own copy; the Json builder is freed).
+    int64 jpos = j.buf.len;
+    let jbuf: *char = alloc<char>(jpos + 1);
+    memcpy(jbuf, Json_cstr(&j), (int)(jpos + 1));
+    String_free(&fld);  String_free(&text);  Json_free(&j);
+
+    // Copy WebP
+    let webp: *uint8 = null;
+    if (ilen > 0) {
+        webp = alloc<uint8>(ilen);
+        memcpy(webp, idata, (int)ilen);
+    }
+
+    printf("[*] datos_biograficos.json (%d campos)\n", nf);
+    printf("[*] foto_ine.webp (%d bytes)\n", (int)ilen);
+
+    json_out[0] = jbuf;   json_len[0] = jpos;
+    webp_out[0] = webp;   webp_len[0] = ilen;
+    return 0;
+}

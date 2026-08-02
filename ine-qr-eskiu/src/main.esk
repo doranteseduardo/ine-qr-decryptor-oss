@@ -1,0 +1,309 @@
+// main.esk — INE QR Decoder HTTP API, in Eskiu.
+//
+// POST /decode (multipart or JSON base64) → JSON with 18 biographical fields +
+// foto_base64; plus /healthz and /stats, X-API-Key auth, per-identity rate
+// limiting, CORS, and a body-size cap. Threaded worker pool.
+//
+// The HTTP plumbing (full binary body read, response writer, multipart parsing,
+// the rate-limit Map, the peer IP) all come from the Eskiu stdlib — this file
+// is just config, routing, and middleware.
+//
+// Config (env, same names as the Go API):
+//   PORT (8080)  API_KEY  WORKERS (4)  MAX_BODY_MB (25)
+//   RATE_PER_SEC (0=off)  RATE_BURST (10)  CORS_ORIGIN (*)
+
+import <mem>;
+import <string>;
+import <net>;
+import <threading>;
+import <env>;
+import <json>;
+import <base64>;
+import <http>;        // HttpReq, http_recv, HttpReq_header, http_reply, http_reply_error
+import <multipart>;   // multipart_boundary, multipart_part
+
+import "ratelimit.esk";
+import "decode_api.esk";
+
+extern int printf(string fmt, ...);
+extern int strlen(string s);
+
+// ── Config + shared state (module globals; workers read them directly) ────────
+
+struct Config {
+    int    port;
+    string api_key;
+    int    has_key;
+    int    workers;
+    int64  max_body;
+    string cors_origin;
+}
+
+struct Stats {
+    Mutex mu;
+    int64 total_req;
+    int64 total_ok;
+    int64 total_4xx;
+    int64 total_5xx;
+}
+
+Config      g_cfg;
+RateLimiter g_rl;
+Stats       g_stats;
+String      g_cors;        // pre-rendered CORS header block
+
+void stats_bump(int which) {
+    Mutex_lock(&g_stats.mu);
+    if (which == 0) { g_stats.total_req = g_stats.total_req + 1; }
+    if (which == 1) { g_stats.total_ok  = g_stats.total_ok  + 1; }
+    if (which == 2) { g_stats.total_4xx = g_stats.total_4xx + 1; }
+    if (which == 3) { g_stats.total_5xx = g_stats.total_5xx + 1; }
+    Mutex_unlock(&g_stats.mu);
+}
+
+// ── Handlers ─────────────────────────────────────────────────────────────────
+
+void handle_healthz(int fd) {
+    let b: String;  String_init(&b, 24);
+    String_append(&b, "{\"status\":\"ok\"}");
+    http_reply(fd, 200, "application/json", String_cstr(&g_cors), &b);
+    String_free(&b);
+}
+
+void json_i64(String* b, string key, int64 v, int comma) {
+    String_append(b, key);
+    let n: String;  String_init(&n, 16);  String_from_int(&n, (int)v);
+    String_append(b, String_cstr(&n));    String_free(&n);
+    if (comma == 1) { String_append(b, ","); }
+}
+
+void handle_stats(int fd) {
+    Mutex_lock(&g_stats.mu);
+    int64 rq = g_stats.total_req;  int64 ok = g_stats.total_ok;
+    int64 c4 = g_stats.total_4xx;  int64 c5 = g_stats.total_5xx;
+    Mutex_unlock(&g_stats.mu);
+
+    let b: String;  String_init(&b, 160);
+    String_append(&b, "{");
+    json_i64(&b, "\"workers\":",   (int64)g_cfg.workers, 1);
+    json_i64(&b, "\"total_req\":", rq, 1);
+    json_i64(&b, "\"total_ok\":",  ok, 1);
+    json_i64(&b, "\"total_4xx\":", c4, 1);
+    json_i64(&b, "\"total_5xx\":", c5, 0);
+    String_append(&b, "}");
+    http_reply(fd, 200, "application/json", String_cstr(&g_cors), &b);
+    String_free(&b);
+}
+
+// Pull the image bytes out of the request (both content types). Returns 1 and
+// sets *img/*ilen plus *owned (1 = heap buffer caller frees, 0 = slice into
+// r.body). 0 on unsupported/invalid input.
+int extract_image(HttpReq* r, **uint8 img, *int64 ilen, *int owned) {
+    let ct: String;  String_init(&ct, 64);
+    HttpReq_header(r, "content-type", &ct);
+
+    int rc = 0;
+    if (String_starts_with(&ct, "application/json") == 1) {
+        *char js = alloc<char>(r.body_len + 1);
+        memcpy((*void)js, (*void)r.body, (int)r.body_len);
+        js[r.body_len] = 0;
+        let jv: *JsonValue = json_parse(js);
+        if (jv != null) {
+            let pv: *JsonValue = JsonValue_get(jv, "photo_base64");
+            if (pv != null) {
+                *char b64 = JsonValue_as_cstr(pv);
+                int b64len = strlen(b64);
+                int cap = base64_decoded_len(b64len);
+                *uint8 raw = alloc<uint8>(cap);
+                int rawlen = base64_decode((*uint8)b64, b64len, raw);
+                if (rawlen > 0) { img[0] = raw; ilen[0] = (int64)rawlen; owned[0] = 1; rc = 1; }
+                else { free(raw); }
+            }
+            JsonValue_free(jv);
+        }
+        free(js);
+    } else if (String_starts_with(&ct, "multipart/form-data") == 1) {
+        let bd: String;  String_init(&bd, 64);
+        if (multipart_boundary(&ct, &bd) == 1) {
+            if (multipart_part(r.body, r.body_len, &bd, "photo", img, ilen) == 1) {
+                owned[0] = 0;
+                rc = 1;
+            }
+        }
+        String_free(&bd);
+    }
+    String_free(&ct);
+    return rc;
+}
+
+void handle_decode(int fd, HttpReq* r, string extra) {
+    if (String_eq_cstr(&r.method, "POST") == 0) {
+        stats_bump(2);  http_reply_error(fd, 405, extra, "POST required");  return;
+    }
+
+    let img: *uint8 = null;  int64 ilen = 0;  int owned = 0;
+    if (extract_image(r, &img, &ilen, &owned) == 0) {
+        stats_bump(2);
+        http_reply_error(fd, 400, extra, "expected multipart 'photo' or JSON photo_base64");
+        return;
+    }
+
+    let resp: String;  String_init(&resp, 512);
+    let err:  String;  String_init(&err, 128);
+    int ok = decode_image_to_json(img, ilen, &resp, &err);
+    if (owned == 1) { free(img); }
+
+    if (ok == 1) {
+        stats_bump(1);
+        http_reply(fd, 200, "application/json", extra, &resp);
+    } else {
+        stats_bump(2);
+        http_reply_error(fd, 422, extra, String_cstr(&err));
+    }
+    String_free(&resp);
+    String_free(&err);
+}
+
+// Format a network-order IPv4 as "a.b.c.d" into `out`.
+void ip_str(uint32 ip, String* out) {
+    int i = 0;
+    while (i < 4) {
+        int byte = (int)((ip >> (i * 8)) & 255);
+        let n: String;  String_init(&n, 4);  String_from_int(&n, byte);
+        String_append(out, String_cstr(&n));  String_free(&n);
+        if (i < 3) { String_push(out, '.'); }
+        i = i + 1;
+    }
+}
+
+// Rate-limit identity: X-API-Key, else X-Forwarded-For, else the peer IP.
+void identity_of(HttpReq* r, uint32 peer, String* out) {
+    String_clear(out);
+    let k: String;  String_init(&k, 48);
+    if (HttpReq_header(r, "x-api-key", &k) == 1 && k.len > 0) {
+        String_append(out, "k:");  String_append(out, String_cstr(&k));  String_free(&k);  return;
+    }
+    String_free(&k);
+    let xff: String;  String_init(&xff, 48);
+    if (HttpReq_header(r, "x-forwarded-for", &xff) == 1 && xff.len > 0) {
+        String_append(out, "ip:");  String_append(out, String_cstr(&xff));  String_free(&xff);  return;
+    }
+    String_free(&xff);
+    String_append(out, "ip:");  ip_str(peer, out);
+}
+
+void handle_conn(int fd, uint32 peer) {
+    let r: HttpReq;  HttpReq_init(&r);
+    int st = http_recv(fd, &r, g_cfg.max_body);
+    stats_bump(0);
+
+    string cors = String_cstr(&g_cors);
+
+    if (String_eq_cstr(&r.method, "OPTIONS") == 1) {
+        let empty: String;  String_init(&empty, 1);
+        http_reply(fd, 204, "text/plain", cors, &empty);
+        String_free(&empty);
+        HttpReq_free(&r);
+        return;
+    }
+
+    if (st != 0) {
+        stats_bump(2);
+        http_reply_error(fd, st, cors, "bad request");
+        HttpReq_free(&r);
+        return;
+    }
+
+    if (String_eq_cstr(&r.path, "/healthz") == 1) {
+        handle_healthz(fd);
+    } else if (String_eq_cstr(&r.path, "/stats") == 1) {
+        handle_stats(fd);
+    } else if (String_eq_cstr(&r.path, "/decode") == 1) {
+        if (g_cfg.has_key == 1) {
+            let k: String;  String_init(&k, 48);
+            int hit = HttpReq_header(&r, "x-api-key", &k);
+            int good = 0;
+            if (hit == 1 && String_eq_cstr(&k, g_cfg.api_key) == 1) { good = 1; }
+            String_free(&k);
+            if (good == 0) { stats_bump(2);  http_reply_error(fd, 401, cors, "unauthorized");  HttpReq_free(&r);  return; }
+        }
+        let id: String;  String_init(&id, 48);  identity_of(&r, peer, &id);
+        int allow = rl_allow(&g_rl, String_cstr(&id));
+        String_free(&id);
+        if (allow == 0) {
+            let extra: String;  String_init(&extra, 96);
+            String_append(&extra, cors);
+            String_append(&extra, "Retry-After: 1\r\n");
+            stats_bump(2);
+            http_reply_error(fd, 429, String_cstr(&extra), "rate limit exceeded");
+            String_free(&extra);
+            HttpReq_free(&r);
+            return;
+        }
+        handle_decode(fd, &r, cors);
+    } else {
+        stats_bump(2);
+        http_reply_error(fd, 405, cors, "not found");
+    }
+
+    HttpReq_free(&r);
+}
+
+void worker_loop(int lfd) {
+    while (1) {
+        let peer: uint32 = 0;
+        int c = net_accept_addr(lfd, &peer);
+        if (c < 0) { continue; }
+        handle_conn(c, peer);
+        net_close(c);
+    }
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+
+void load_config() {
+    g_cfg.port        = env_get_int("PORT", 8080);
+    g_cfg.api_key     = env_get_or("API_KEY", "");
+    g_cfg.has_key     = 0;
+    if (strlen(g_cfg.api_key) > 0) { g_cfg.has_key = 1; }
+    g_cfg.workers     = env_get_int("WORKERS", 4);
+    if (g_cfg.workers < 1) { g_cfg.workers = 1; }
+    g_cfg.max_body    = (int64)env_get_int("MAX_BODY_MB", 25) * 1024 * 1024;
+    g_cfg.cors_origin = env_get_or("CORS_ORIGIN", "*");
+
+    int rate  = env_get_int("RATE_PER_SEC", 0);
+    int burst = env_get_int("RATE_BURST", 10);
+    int rl_on = 0;
+    if (rate > 0) { rl_on = 1; }
+    rl_init(&g_rl, (double)rate, burst, rl_on);
+
+    String_init(&g_cors, 160);
+    String_append(&g_cors, "Access-Control-Allow-Origin: ");
+    String_append(&g_cors, g_cfg.cors_origin);
+    String_append(&g_cors, "\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\n");
+    String_append(&g_cors, "Access-Control-Allow-Headers: Content-Type, X-API-Key\r\nVary: Origin\r\n");
+
+    Mutex_init(&g_stats.mu);
+    g_stats.total_req = 0;  g_stats.total_ok = 0;
+    g_stats.total_4xx = 0;  g_stats.total_5xx = 0;
+}
+
+int main() {
+    load_config();
+
+    int lfd = net_tcp_listen((uint16)g_cfg.port);
+    if (lfd < 0) { printf("error: cannot bind port %d\n", g_cfg.port); return 1; }
+
+    printf("INE QR API (Eskiu) — port=%d workers=%d max_body=%lldMiB\n",
+           g_cfg.port, g_cfg.workers, g_cfg.max_body / 1024 / 1024);
+    if (g_cfg.has_key == 0) { printf("WARNING: API_KEY not set — no authentication\n"); }
+
+    int spawned = 1;
+    while (spawned < g_cfg.workers) {
+        let w: fn()->void = void() { worker_loop(lfd); };
+        thread_create(w);
+        spawned = spawned + 1;
+    }
+    worker_loop(lfd);
+    return 0;
+}

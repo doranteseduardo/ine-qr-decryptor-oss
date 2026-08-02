@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>INE QR — WASM demo</title>
+<style>
+  body { font: 14px ui-monospace, monospace; max-width: 760px; margin: 2em auto; padding: 0 1em; color: #111; }
+  h1   { font-size: 1.1em; }
+  .row { display: flex; gap: 1em; align-items: flex-start; margin: 1em 0; }
+  .col { flex: 1; }
+  pre  { background: #f4f4f4; padding: .8em; overflow: auto; }
+  img  { max-width: 256px; border: 1px solid #ccc; image-rendering: pixelated; }
+  .pill { display: inline-block; padding: 2px 8px; background: #eef; border-radius: 10px; }
+  input[type=file] { font: inherit; }
+  .status.err { color: #b00; }
+  .status.ok  { color: #060; }
+</style>
+</head>
+<body>
+<h1>INE QR pipeline — pure WASM</h1>
+<p>
+  Carga las dos mitades del QR (cada una un blob binario de 858 bytes, sin
+  decodificar). El modulo descifra AES + RSA en el navegador y devuelve los
+  datos biograficos + foto.
+</p>
+
+<div class="row">
+  <label>QR izquierdo: <input id="left" type="file" accept=".bin"></label>
+  <label>QR derecho:   <input id="right" type="file" accept=".bin"></label>
+  <button id="run" disabled>Decodificar</button>
+</div>
+
+<div id="status" class="status">Cargando WASM...</div>
+
+<div class="row">
+  <div class="col">
+    <h3>Datos biograficos</h3>
+    <pre id="json">-</pre>
+  </div>
+  <div class="col">
+    <h3>Foto</h3>
+    <img id="photo" alt="(esperando)">
+  </div>
+</div>
+
+<p>
+  <span class="pill" id="size">-</span>
+  <span class="pill" id="time">-</span>
+</p>
+
+<script type="module">
+  import createIneQrModule from "./dist/ine_qr.js";
+
+  const $ = (id) => document.getElementById(id);
+  const setStatus = (msg, cls) => {
+    const el = $("status");
+    el.className = "status" + (cls ? " " + cls : "");
+    el.textContent = msg;
+  };
+
+  const Module = await createIneQrModule();
+  setStatus(`WASM listo (${(Module.HEAPU8.length/1024).toFixed(0)} KB heap)`, "ok");
+  $("run").disabled = false;
+
+  async function readBytes(input) {
+    if (!input.files[0]) return null;
+    return new Uint8Array(await input.files[0].arrayBuffer());
+  }
+
+  $("run").addEventListener("click", async () => {
+    setStatus("Procesando...");
+    const left  = await readBytes($("left"));
+    const right = await readBytes($("right"));
+    if (!left || !right) {
+      setStatus("Faltan archivos.", "err");
+      return;
+    }
+    if (left.length !== 858 || right.length !== 858) {
+      setStatus(`Cada mitad debe ser 858 bytes (recibido ${left.length}/${right.length}).`, "err");
+      return;
+    }
+
+    const combined = new Uint8Array(1712);
+    combined.set(left.subarray(2), 0);
+    combined.set(right.subarray(2), 856);
+
+    const t0 = performance.now();
+    const ptr = Module._alloc_buf(combined.length);
+    Module.HEAPU8.set(combined, ptr);
+    const rc = Module._decode_qr(ptr, combined.length);
+    Module._free_buf(ptr);
+    const dt = performance.now() - t0;
+
+    if (rc !== 0) {
+      setStatus(`decode_qr fallo (rc=${rc})`, "err");
+      return;
+    }
+
+    const json_len = Module._get_json_len();
+    const json = Module.UTF8ToString(Module._get_json_ptr(), json_len);
+    const webp_ptr = Module._get_webp_ptr();
+    const webp_len = Module._get_webp_len();
+    const webp = Module.HEAPU8.slice(webp_ptr, webp_ptr + webp_len);
+
+    $("json").textContent = json;
+    const url = URL.createObjectURL(new Blob([webp], { type: "image/webp" }));
+    $("photo").src = url;
+    $("size").textContent = `JSON ${json_len} B / WebP ${webp_len} B`;
+    $("time").textContent = `${dt.toFixed(0)} ms`;
+    setStatus("OK", "ok");
+  });
+</script>
+</body>
+</html>
