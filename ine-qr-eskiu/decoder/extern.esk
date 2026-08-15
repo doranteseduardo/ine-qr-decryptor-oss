@@ -1,0 +1,49 @@
+// extern.esk — C library declarations used by the pipeline.
+//
+// Link flags (see Makefile):
+//   -lcrypto  -lZXing
+//   -framework CoreFoundation -framework CoreGraphics -framework ImageIO  (macOS)
+
+import "types.esk";
+
+// ── libc ──────────────────────────────────────────────────────────────────────
+extern int   printf(string fmt, ...);
+extern int   strlen(string s);
+extern *void memcpy(*void dst, *void src, int n);
+extern *void memset(*void dst, int c, int n);
+extern *void fopen(string path, string mode);
+
+// ── OpenSSL EVP — AES-256-CBC ─────────────────────────────────────────────────
+extern *void EVP_CIPHER_CTX_new();
+extern void  EVP_CIPHER_CTX_free(*void ctx);
+extern *void EVP_aes_256_cbc();
+extern int   EVP_DecryptInit_ex(*void ctx, *void type, *void engine, *uint8 key, *uint8 iv);
+extern int   EVP_DecryptUpdate(*void ctx, *uint8 out, *int outl, *uint8 inp, int inl);
+extern int   EVP_DecryptFinal_ex(*void ctx, *uint8 out, *int outl);
+extern int   fclose(*void fp);
+extern int   fwrite(*void buf, int size, int count, *void fp);
+// `free` comes from <mem> (imported by the modules that use it); not a keyword.
+extern int64 clock();
+
+// ── String utilities ─────────────────────────────────────────────────────────
+extern int    sscanf(string buf, string fmt, ...);
+extern string strstr(string hay, string needle);
+extern *void  memmem(*void hay, int64 hlen, *void needle, int64 nlen);
+
+// ── OpenSSL BigNum (RSA-8192 raw operations) ──────────────────────────────────
+extern *void BN_new();
+extern void  BN_free(*void bn);
+extern *void BN_CTX_new();
+extern void  BN_CTX_free(*void ctx);
+extern *void BN_bin2bn(*uint8 s, int len, *void ret);
+extern int   BN_bn2bin(*void a, *uint8 to);
+extern int   BN_num_bits(*void a);   // BN_num_bytes is a macro; use BN_num_bits
+extern int   BN_mod_exp(*void r, *void a, *void p, *void m, *void ctx);
+
+// ── Stage 1 — QR extraction (qr_extract.c + qr_extract_impl.cpp) ─────────────
+// Detects two QR codes in the image, extracts 858-byte payloads, sorts left/right
+// by bounding-box X position. Returns 1 on success, 0 on failure.
+extern int ine_qr_extract(string image_path, *QRPair out);
+
+// run_no_so_pipeline and decode_to_buffers are now implemented in
+// crypto.esk and output.esk — no longer C extern calls.

@@ -1,0 +1,51 @@
+output/
+__pycache__/
+*.pyc
+.DS_Store
+*.HEIC
+*.heic
+*.HEIF
+*.heif
+*.jpg
+*.jpeg
+*.png
+
+# C build artifacts
+ine-qr-c/src/*.o
+ine-qr-c/ine_decode
+ine-qr-c/ine_decode_emulator
+ine-qr-c/libine_decode.a
+
+# Android (Gradle + CMake + AGP)
+ine-qr-android/.gradle/
+ine-qr-android/build/
+ine-qr-android/*/build/
+ine-qr-android/local.properties
+ine-qr-android/.idea/
+ine-qr-android/*.iml
+ine-qr-android/.cxx/
+ine-qr-android/*/.cxx/
+ine-qr-android/captures/
+
+# WASM build output (regenerate with ine-qr-wasm/build.sh)
+ine-qr-wasm/dist/
+
+# iOS / SwiftPM
+ine-qr-ios/.build/
+ine-qr-ios/.swiftpm/
+ine-qr-ios/dist/
+ine-qr-ios/Package.resolved
+ine-qr-ios/*.xcodeproj/xcuserdata/
+ine-qr-ios/*.xcworkspace/xcuserdata/
+ine-qr-ios/DerivedData/
+
+# Editors / IDEs
+*.swp
+.vscode/
+
+# Secrets
+.env
+/ine-qr-c/.idea
+
+# Local tooling / agent settings
+.claude/settings.local.json

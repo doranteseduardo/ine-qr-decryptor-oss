@@ -1,0 +1,20 @@
+{
+  "tipo": "N",
+  "cic": "000000000",
+  "ocr": "0000000000000",
+  "curp": "XEXX010101HNEXXXA4",
+  "nombre": "JUAN",
+  "apellido1": "PEREZ",
+  "apellido2": "EXAMPLE",
+  "entidad": "09",
+  "municipio": "001",
+  "seccion": "0001",
+  "etnia": "",
+  "vigencia": "2020/2030",
+  "sexo": "H",
+  "indiceHuella1": "1",
+  "indiceHuella2": "",
+  "version": "X",
+  "fechaGeneracion": "20200101",
+  "firmaVerificadora": "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+}
